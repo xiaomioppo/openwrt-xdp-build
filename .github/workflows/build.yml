@@ -55,16 +55,15 @@ jobs:
         # ---- XDP / AF_XDP ----
         sed -i 's|^# CONFIG_XDP_SOCKETS is not set$|CONFIG_XDP_SOCKETS=y\nCONFIG_XDP_SOCKETS_DIAG=y|' \
           target/linux/generic/config-6.12
-        # ---- DPDK/VPP: UIO, VFIO, 大页, IOMMU, PCI MSI ----
+        # ---- DPDK 前置：大页 + IOMMU + PCI MSI（UIO/VFIO 走 kmod 包，避免 Kconfig 子选项 NEW 提示挂死）----
         sed -i \
-            -e 's|^# CONFIG_UIO is not set$|CONFIG_UIO=y\nCONFIG_UIO_PCI_GENERIC=y|' \
-            -e 's|^# CONFIG_VFIO is not set$|CONFIG_VFIO=y\nCONFIG_VFIO_PCI=y\nCONFIG_VFIO_PCI_CORE=y\nCONFIG_VFIO_NOIOMMU=y\nCONFIG_VFIO_IOMMU_TYPE1=y\nCONFIG_VFIO_VIRQFD=y|' \
             -e 's|^# CONFIG_HUGETLBFS is not set$|CONFIG_HUGETLBFS=y|' \
             -e 's|^# CONFIG_HUGETLB_PAGE is not set$|CONFIG_HUGETLB_PAGE=y|' \
             -e 's|^# CONFIG_TRANSPARENT_HUGEPAGE is not set$|CONFIG_TRANSPARENT_HUGEPAGE=y\n# CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS is not set\nCONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y\n# CONFIG_TRANSPARENT_HUGEPAGE_NEVER is not set\n# CONFIG_READ_ONLY_THP_FOR_FS is not set|' \
-            -e 's|^# CONFIG_IOMMU_SUPPORT is not set$|CONFIG_IOMMU_SUPPORT=y\nCONFIG_IOMMU_API=y\nCONFIG_IOMMU_DEFAULT_DMA_LAZY=y\nCONFIG_IOMMU_IOVA=y\nCONFIG_IOMMU_DMA=y\nCONFIG_IRQ_REMAP=y|' \
             -e 's|^# CONFIG_PCI_MSI is not set$|CONFIG_PCI_MSI=y\nCONFIG_PCI_MSI_IRQ_DOMAIN=y|' \
             target/linux/generic/config-6.12
+        # IOMMU_SUPPORT 通过 x86/64 里 INTEL_IOMMU=y / AMD_IOMMU=y 隐式 select，不用直接设
+        # UIO / VFIO 走下面的 CONFIG_PACKAGE_kmod-uio / kmod-vfio（OpenWrt 用 kmod 包机制绕开 Kconfig NEW 子选项问题）
         echo "===改动确认==="
         grep -E 'CONFIG_(UIO|VFIO|HUGETLB|IOMMU_SUPPORT|TRANSPARENT_HUGE|PCI_MSI|XDP_SOCKETS)(_|$|=)' target/linux/generic/config-6.12 | head -30
 
