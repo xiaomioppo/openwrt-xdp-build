@@ -1,0 +1,322 @@
+#!/bin/sh
+# xdp-fw-ctl — AF_XDP NAT 管理 CLI
+
+STATS=/run/xdp-fw.stats
+CONNS=/run/xdp-fw.conns
+
+usage() {
+cat <<EOF
+用法: xdp-fw-ctl <命令> [参数]
+
+服务管理:
+  start | stop | restart | status
+  config                          查看 UCI 配置
+  enable / disable                置 enabled 并启停
+  set-wan <iface> <ip>
+  set-lan <iface> <cidr>
+
+端口转发 (IPv4 DNAT):
+  forward-add   <tcp|udp> <wan_port> <lan_ip> <lan_port>
+  forward-del   <tcp|udp> <wan_port>
+  forward-list
+
+IPv6 NPTv6 前缀转换（无状态前缀替换）:
+  npt6-add      <inside_prefix> <outside_prefix> <plen>
+  npt6-del      <inside_prefix>
+  npt6-list
+
+NAT66 (IPv6 NAPT):
+  set-wan6 <IPv6>                   启用 NAT66，设 WAN IPv6（NAT 伪装源）
+  clear-wan6                        禁用 NAT66
+
+NAT64 (v6 客户端 → v4 互联网):
+  set-nat64 <prefix/plen>           启用（推荐 64:ff9b::/96）
+  clear-nat64                       禁用
+
+NAT46 静态映射（v4 客户端 → v6 后端）:
+  nat46-add       <v4_target> <v6_real>
+  nat46-del       <v4_target>
+  nat46-list
+  set-nat46-src   <IPv6>        一组 v4 客户端共享此 v6 源（SNAT46 池）
+  clear-nat46-src               每客户端独立合成 v6 源（默认）
+
+观测:
+  conns                           触发 SIGUSR1 并显示 /run/xdp-fw.conns
+  stats                           显示 /run/xdp-fw.stats
+  live [interval]                 watch 模式（默认 2 秒）
+
+警告：启用后 LAN↔WAN 的 TCP/UDP 绕过内核栈。仅隔离测试网使用。
+EOF
+}
+
+service_cmd() { /etc/init.d/xdp-fw "$1"; }
+
+cmd_status() {
+    echo "=== service ==="
+    /etc/init.d/xdp-fw status
+    echo
+    echo "=== uci ==="
+    uci show xdp-fw 2>/dev/null
+    echo
+    if [ -f "$STATS" ]; then
+        echo "=== stats ==="
+        cat "$STATS"
+    fi
+    echo
+    echo "=== XDP attach ==="
+    command -v xdp-loader >/dev/null 2>&1 && xdp-loader status 2>/dev/null | head -8
+}
+
+# ---- 端口转发 ----
+
+cmd_forward_add() {
+    proto="$1"; wp="$2"; lip="$3"; lp="$4"
+    [ -z "$proto" ] || [ -z "$wp" ] || [ -z "$lip" ] || [ -z "$lp" ] && {
+        echo "用法: xdp-fw-ctl forward-add <tcp|udp> <wan_port> <lan_ip> <lan_port>"; exit 1
+    }
+    case "$proto" in tcp|udp) ;; *) echo "proto 必须 tcp 或 udp"; exit 1 ;; esac
+
+    # 删除同 proto+wan_port 的旧规则
+    cmd_forward_del "$proto" "$wp" >/dev/null 2>&1
+
+    # 添加新 forward section
+    sect=$(uci add xdp-fw forward)
+    uci set "xdp-fw.$sect.enabled=1"
+    uci set "xdp-fw.$sect.proto=$proto"
+    uci set "xdp-fw.$sect.wan_port=$wp"
+    uci set "xdp-fw.$sect.lan_ip=$lip"
+    uci set "xdp-fw.$sect.lan_port=$lp"
+    uci commit xdp-fw
+    echo "✓ 添加 $proto:$wp → $lip:$lp"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+
+cmd_forward_del() {
+    proto="$1"; wp="$2"
+    [ -z "$proto" ] || [ -z "$wp" ] && { echo "用法: xdp-fw-ctl forward-del <tcp|udp> <wan_port>"; exit 1; }
+    # 找出匹配的 section 并删
+    deleted=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=forward$/ {print $2}' | awk -F= '{print $1}'); do
+        p=$(uci -q get "xdp-fw.$sect.proto")
+        w=$(uci -q get "xdp-fw.$sect.wan_port")
+        if [ "$p" = "$proto" ] && [ "$w" = "$wp" ]; then
+            uci delete "xdp-fw.$sect"
+            deleted=1
+        fi
+    done
+    uci commit xdp-fw
+    [ "$deleted" = 1 ] && { echo "✓ 已删除 $proto:$wp"; /etc/init.d/xdp-fw reload 2>/dev/null; } || echo "(未找到规则)"
+}
+
+cmd_forward_list() {
+    printf "  %-5s %-8s %-18s %-8s %s\n" "PROTO" "WAN端口" "LAN_IP" "LAN端口" "状态"
+    echo  "  ----- -------- ------------------ -------- ------"
+    found=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=forward$/ {print $2}' | awk -F= '{print $1}'); do
+        found=1
+        p=$(uci -q get "xdp-fw.$sect.proto")
+        w=$(uci -q get "xdp-fw.$sect.wan_port")
+        i=$(uci -q get "xdp-fw.$sect.lan_ip")
+        l=$(uci -q get "xdp-fw.$sect.lan_port")
+        e=$(uci -q get "xdp-fw.$sect.enabled"); e=${e:-1}
+        st=$([ "$e" = "1" ] && echo "启用" || echo "禁用")
+        printf "  %-5s %-8s %-18s %-8s %s\n" "$p" "$w" "$i" "$l" "$st"
+    done
+    [ "$found" = 0 ] && echo "  (无规则)"
+}
+
+# ---- IPv6 NPT ----
+
+cmd_npt6_add() {
+    inside="$1"; outside="$2"; plen="${3:-64}"
+    [ -z "$inside" ] || [ -z "$outside" ] && {
+        echo "用法: xdp-fw-ctl npt6-add <inside> <outside> [plen=64]"; exit 1
+    }
+    # 删旧
+    cmd_npt6_del "$inside" >/dev/null 2>&1
+    sect=$(uci add xdp-fw npt6)
+    uci set "xdp-fw.$sect.enabled=1"
+    uci set "xdp-fw.$sect.inside=$inside"
+    uci set "xdp-fw.$sect.outside=$outside"
+    uci set "xdp-fw.$sect.plen=$plen"
+    uci commit xdp-fw
+    echo "✓ 添加 NPTv6: $inside/$plen → $outside/$plen"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_npt6_del() {
+    inside="$1"
+    [ -z "$inside" ] && { echo "用法: xdp-fw-ctl npt6-del <inside>"; exit 1; }
+    deleted=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=npt6$/ {print $2}' | awk -F= '{print $1}'); do
+        i=$(uci -q get "xdp-fw.$sect.inside")
+        if [ "$i" = "$inside" ]; then
+            uci delete "xdp-fw.$sect"; deleted=1
+        fi
+    done
+    uci commit xdp-fw
+    [ "$deleted" = 1 ] && { echo "✓ 已删除 $inside"; /etc/init.d/xdp-fw reload 2>/dev/null; } || echo "(未找到)"
+}
+cmd_nat46_add() {
+    v4="$1"; v6="$2"
+    [ -z "$v4" ] || [ -z "$v6" ] && { echo "用法: xdp-fw-ctl nat46-add <v4_target> <v6_real>"; exit 1; }
+    cmd_nat46_del "$v4" >/dev/null 2>&1
+    sect=$(uci add xdp-fw nat46)
+    uci set "xdp-fw.$sect.enabled=1"
+    uci set "xdp-fw.$sect.v4_target=$v4"
+    uci set "xdp-fw.$sect.v6_real=$v6"
+    uci commit xdp-fw
+    echo "✓ 添加 NAT46: $v4 → $v6"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_nat46_del() {
+    v4="$1"; [ -z "$v4" ] && { echo "用法: xdp-fw-ctl nat46-del <v4_target>"; exit 1; }
+    deleted=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=nat46$/ {print $2}' | awk -F= '{print $1}'); do
+        t=$(uci -q get "xdp-fw.$sect.v4_target")
+        [ "$t" = "$v4" ] && { uci delete "xdp-fw.$sect"; deleted=1; }
+    done
+    uci commit xdp-fw
+    [ "$deleted" = 1 ] && { echo "✓ 已删除 $v4"; /etc/init.d/xdp-fw reload 2>/dev/null; } || echo "(未找到)"
+}
+cmd_nat46_list() {
+    printf "  %-18s  %-30s  %s\n" "V4_TARGET" "V6_REAL" "状态"
+    echo  "  ------------------  ------------------------------  ----"
+    found=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=nat46$/ {print $2}' | awk -F= '{print $1}'); do
+        found=1
+        v4=$(uci -q get "xdp-fw.$sect.v4_target")
+        v6=$(uci -q get "xdp-fw.$sect.v6_real")
+        e=$(uci -q get "xdp-fw.$sect.enabled"); e=${e:-1}
+        st=$([ "$e" = "1" ] && echo "启用" || echo "禁用")
+        printf "  %-18s  %-30s  %s\n" "$v4" "$v6" "$st"
+    done
+    [ "$found" = 0 ] && echo "  (无规则)"
+}
+
+cmd_set_wan6() {
+    [ -z "$1" ] && { echo "用法: xdp-fw-ctl set-wan6 <IPv6>"; exit 1; }
+    uci set xdp-fw.main.wan_ip6="$1"
+    uci commit xdp-fw
+    echo "✓ wan_ip6=$1 (启用 NAT66)"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_clear_wan6() {
+    uci -q delete xdp-fw.main.wan_ip6
+    uci commit xdp-fw
+    echo "✓ 已禁用 NAT66"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_set_nat64() {
+    [ -z "$1" ] && { echo "用法: xdp-fw-ctl set-nat64 <prefix/plen>"; exit 1; }
+    uci set xdp-fw.main.nat64_prefix="$1"
+    uci commit xdp-fw
+    echo "✓ NAT64 前缀=$1"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_clear_nat64() {
+    uci -q delete xdp-fw.main.nat64_prefix
+    uci commit xdp-fw
+    echo "✓ 已禁用 NAT64"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_set_nat46_src() {
+    [ -z "$1" ] && { echo "用法: xdp-fw-ctl set-nat46-src <IPv6>"; exit 1; }
+    uci set xdp-fw.main.nat46_v6_src="$1"
+    uci commit xdp-fw
+    echo "✓ NAT46 v6 源=$1（一组 v4 客户端共享此源出站）"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+cmd_clear_nat46_src() {
+    uci -q delete xdp-fw.main.nat46_v6_src
+    uci commit xdp-fw
+    echo "✓ 已切回每客户端独立合成 v6 源"
+    /etc/init.d/xdp-fw reload 2>/dev/null
+}
+
+cmd_npt6_list() {
+    printf "  %-28s  %-28s  %-4s %s\n" "INSIDE" "OUTSIDE" "PLEN" "状态"
+    echo  "  ----------------------------  ----------------------------  ---- ----"
+    found=0
+    for sect in $(uci show xdp-fw 2>/dev/null | awk -F. '/=npt6$/ {print $2}' | awk -F= '{print $1}'); do
+        found=1
+        i=$(uci -q get "xdp-fw.$sect.inside")
+        o=$(uci -q get "xdp-fw.$sect.outside")
+        p=$(uci -q get "xdp-fw.$sect.plen")
+        e=$(uci -q get "xdp-fw.$sect.enabled"); e=${e:-1}
+        st=$([ "$e" = "1" ] && echo "启用" || echo "禁用")
+        printf "  %-28s  %-28s  %-4s %s\n" "$i" "$o" "$p" "$st"
+    done
+    [ "$found" = 0 ] && echo "  (无规则)"
+}
+
+# ---- 观测 ----
+
+cmd_stats() {
+    [ -f "$STATS" ] || { echo "✗ $STATS 不存在（服务未运行？）"; return 1; }
+    cat "$STATS"
+}
+
+cmd_conns() {
+    pid=$(pidof xdp_fw 2>/dev/null)
+    [ -z "$pid" ] && { echo "✗ xdp_fw 未运行"; return 1; }
+    kill -USR1 "$pid"
+    sleep 0.3
+    [ -f "$CONNS" ] || { echo "✗ $CONNS 未生成"; return 1; }
+    cat "$CONNS"
+}
+
+cmd_live() {
+    interval="${1:-2}"
+    trap 'exit 0' INT
+    while :; do
+        clear
+        date
+        echo "=== stats ==="
+        cmd_stats 2>/dev/null
+        echo
+        echo "=== forward 规则 ==="
+        cmd_forward_list
+        echo
+        echo "=== 活跃连接（TOP 20） ==="
+        pid=$(pidof xdp_fw)
+        [ -n "$pid" ] && kill -USR1 "$pid" && sleep 0.2 && [ -f "$CONNS" ] && head -21 "$CONNS"
+        sleep "$interval"
+    done
+}
+
+case "${1:-}" in
+    start)         service_cmd start ;;
+    stop)          service_cmd stop ;;
+    restart)       service_cmd restart ;;
+    status)        cmd_status ;;
+    config)        uci show xdp-fw ;;
+    set-wan)       uci set xdp-fw.main.wan_if="$2"; uci set xdp-fw.main.wan_ip="$3"; uci commit xdp-fw; echo "✓" ;;
+    set-lan)       uci set xdp-fw.main.lan_if="$2"; uci set xdp-fw.main.lan_cidr="$3"; uci commit xdp-fw; echo "✓" ;;
+    enable)        uci set xdp-fw.main.enabled=1; uci commit xdp-fw; /etc/init.d/xdp-fw enable; /etc/init.d/xdp-fw start ;;
+    disable)       /etc/init.d/xdp-fw stop; /etc/init.d/xdp-fw disable; uci set xdp-fw.main.enabled=0; uci commit xdp-fw ;;
+
+    forward-add)   shift; cmd_forward_add "$@" ;;
+    forward-del)   shift; cmd_forward_del "$@" ;;
+    forward-list)  cmd_forward_list ;;
+
+    npt6-add)      shift; cmd_npt6_add "$@" ;;
+    npt6-del)      shift; cmd_npt6_del "$@" ;;
+    npt6-list)     cmd_npt6_list ;;
+
+    nat46-add)     shift; cmd_nat46_add "$@" ;;
+    nat46-del)     shift; cmd_nat46_del "$@" ;;
+    nat46-list)    cmd_nat46_list ;;
+    set-wan6)      shift; cmd_set_wan6 "$@" ;;
+    clear-wan6)    cmd_clear_wan6 ;;
+    set-nat64)     shift; cmd_set_nat64 "$@" ;;
+    clear-nat64)   cmd_clear_nat64 ;;
+    set-nat46-src) shift; cmd_set_nat46_src "$@" ;;
+    clear-nat46-src) cmd_clear_nat46_src ;;
+
+    stats)         cmd_stats ;;
+    conns)         cmd_conns ;;
+    live)          cmd_live "$2" ;;
+
+    ""|help|-h|--help) usage ;;
+    *) echo "未知命令: $1"; usage; exit 1 ;;
+esac

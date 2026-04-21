@@ -1,0 +1,13 @@
+{
+	"admin/network/xdp/fw": {
+		"title": "XDP 防火墙",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "xdp-fw/manage"
+		},
+		"depends": {
+			"acl": [ "luci-app-xdp-fw" ]
+		}
+	}
+}

@@ -1,0 +1,36 @@
+{
+	"luci-app-xdp-fw": {
+		"description": "Grant access to xdp-fw management",
+		"read": {
+			"uci": [ "xdp-fw" ],
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/sbin/xdp-fw-ctl":  [ "exec" ],
+				"/usr/sbin/xdp-loader":   [ "exec" ],
+				"/usr/bin/pgrep":         [ "exec" ],
+				"/sbin/logread":          [ "exec" ],
+				"/etc/init.d/xdp-fw":    [ "exec" ],
+				"/run/xdp-fw.stats":     [ "read" ],
+				"/run/xdp-fw.conns":     [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec", "read" ],
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "xdp-fw", "xdp" ],
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/sbin/xdp-fw-ctl": [ "exec" ],
+				"/usr/sbin/xdp-loader":  [ "exec" ],
+				"/usr/sbin/xdp-ctl":     [ "exec" ],
+				"/etc/init.d/xdp-fw":   [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ],
+				"service": [ "event", "set", "delete" ]
+			}
+		}
+	}
+}
