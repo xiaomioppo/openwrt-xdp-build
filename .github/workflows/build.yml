@@ -1,16 +1,7 @@
-name: Build OpenWrt 25.12.2 x86_64 with XDP_SOCKETS + xdp-nat
+name: Build kernel + XDP stack (minimal)
 
 on:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: '构建类型'
-        required: true
-        default: 'full'
-        type: choice
-        options:
-          - full       # 完整固件（sysupgrade img.gz）
-          - kernel     # 只打包 kernel + modules（手动替换用）
   push:
     branches: [ main ]
     paths:
@@ -19,23 +10,20 @@ on:
 
 env:
   OPENWRT_VERSION: v25.12.2
-  TARGET: x86
-  SUBTARGET: 64
 
 jobs:
   build:
-    name: Build OpenWrt
+    name: Kernel + XDP only (方案 C)
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     steps:
-    - name: Checkout
+    - name: Checkout workspace
       uses: actions/checkout@v4
       with:
         path: workspace
 
-    # OpenWrt build 需要 ~15GB 磁盘，GitHub runner 默认只剩 14GB
-    # 清理预装的 Android SDK / .NET / GHC / 大包，能腾出 ~40GB
+    # OpenWrt build 要 ~15GB 磁盘，runner 默认只剩 14GB 可用；先腾出 ~40GB
     - name: Free up disk space
       uses: jlumbroso/free-disk-space@main
       with:
@@ -47,7 +35,7 @@ jobs:
         docker-images: true
         swap-storage: true
 
-    - name: Install build dependencies
+    - name: Install build deps
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -60,25 +48,18 @@ jobs:
       run: |
         git clone --depth 1 --branch ${{ env.OPENWRT_VERSION }} \
           https://github.com/openwrt/openwrt.git openwrt
-        cd openwrt
-        git log -1 --oneline
 
-    - name: Enable CONFIG_XDP_SOCKETS in kernel config
+    - name: Enable CONFIG_XDP_SOCKETS in kernel
       run: |
         cd openwrt
-        echo "--- 修改前 ---"
-        grep -n 'XDP_SOCKETS' target/linux/generic/config-6.12 || true
         sed -i 's|^# CONFIG_XDP_SOCKETS is not set$|CONFIG_XDP_SOCKETS=y\nCONFIG_XDP_SOCKETS_DIAG=y|' \
           target/linux/generic/config-6.12
-        echo "--- 修改后 ---"
         grep -n 'XDP_SOCKETS' target/linux/generic/config-6.12
 
-    - name: Inject xdp-nat custom package
+    - name: Inject xdp-nat package
       run: |
         mkdir -p openwrt/package/custom
         cp -r workspace/custom/xdp-nat openwrt/package/custom/xdp-nat
-        echo "--- xdp-nat 包已就位 ---"
-        ls -la openwrt/package/custom/xdp-nat/
 
     - name: Update & install feeds
       run: |
@@ -86,90 +67,105 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Configure build
+    - name: Configure (minimal — 只选需要的)
       run: |
         cd openwrt
+        # 先下 release 的 config 作为基线（保证 kernel ABI 兼容当前路由器）
         wget -q https://downloads.openwrt.org/releases/25.12.2/targets/x86/64/config.buildinfo -O .config
+        # 追加我们的 kernel 选项 + XDP 包
         cat >> .config <<EOF
 
-        # === 我们的附加配置 ===
+        # === kernel 侧 ===
         CONFIG_KERNEL_XDP_SOCKETS=y
         CONFIG_KERNEL_XDP_SOCKETS_DIAG=y
+
+        # === 用户态 XDP 包 ===
         CONFIG_PACKAGE_libxdp=y
         CONFIG_PACKAGE_libbpf=y
         CONFIG_PACKAGE_xdp-loader=y
         CONFIG_PACKAGE_xdp-filter=y
         CONFIG_PACKAGE_xdpdump=y
+        CONFIG_PACKAGE_bpftool=y
         CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
         CONFIG_PACKAGE_xdp-nat=y
-        CONFIG_PACKAGE_bpftool=y
         EOF
         make defconfig
-        echo "--- 关键项确认 ---"
-        grep -E 'XDP_SOCK|PACKAGE_libxdp|PACKAGE_xdp-|PACKAGE_kmod-xdp|PACKAGE_bpftool' .config | grep -v '^#'
+        echo "--- XDP 相关项确认 ---"
+        grep -E 'XDP|bpftool' .config | grep -v '^#' | head -20
 
-    - name: Download sources
+    - name: Download sources only (parallel)
+      run: cd openwrt && make download -j8
+
+    # 关键优化：tools + toolchain 必须编完（kernel / 包都依赖它）
+    # 但之后只编 kernel + 我们需要的几个 package，不走 `make world`
+    - name: Compile tools
+      run: cd openwrt && FORCE_UNSAFE_CONFIGURE=1 make tools/install -j$(nproc)
+
+    - name: Compile toolchain (gcc × 2 bootstrap，最耗时的一步)
+      run: cd openwrt && FORCE_UNSAFE_CONFIGURE=1 make toolchain/install -j$(nproc)
+
+    - name: Compile kernel + modules
+      run: cd openwrt && FORCE_UNSAFE_CONFIGURE=1 make target/linux/compile -j$(nproc) V=s 2>&1 | tail -100
+
+    - name: Compile XDP user-space stack
       run: |
         cd openwrt
-        make download -j8 || make download -j1 V=s
+        FORCE_UNSAFE_CONFIGURE=1 make \
+          package/feeds/base/libbpf/compile \
+          package/feeds/base/xdp-tools/compile \
+          package/feeds/base/bpftool/compile \
+          -j$(nproc) V=s 2>&1 | tail -50
 
-    - name: Compile (with parallel -j$(nproc))
+    - name: Compile xdp-nat custom package
       run: |
         cd openwrt
-        FORCE_UNSAFE_CONFIGURE=1 make -j$(nproc) world \
-          || (echo '--- -j$(nproc) 失败，降级到 -j1 V=s ---' && \
-              FORCE_UNSAFE_CONFIGURE=1 make -j1 V=s world)
+        FORCE_UNSAFE_CONFIGURE=1 make package/custom/xdp-nat/compile -j$(nproc) V=sc
 
-    - name: Inspect build artifacts
+    - name: Collect artifacts
       run: |
         cd openwrt
-        echo "=== bin/targets/x86/64/ 产物 ==="
-        ls -lh bin/targets/x86/64/ 2>/dev/null || echo "(empty)"
-        echo "=== bin/packages/x86_64/ xdp-nat 包 ==="
-        find bin/packages/ -name 'xdp-nat*' -o -name 'libxdp*' -o -name 'kmod-xdp*' 2>/dev/null | xargs -I{} ls -lh {}
-        echo "=== kernel 大小 ==="
-        find build_dir/target-*/linux-*/linux-6.12.*/arch/x86/boot/bzImage 2>/dev/null | xargs -I{} ls -lh {} || true
+        mkdir -p /tmp/release
 
-    - name: Verify XDP_SOCKETS is in built kernel
-      run: |
-        cd openwrt
-        KCONFIG=$(find build_dir/target-*/linux-*/linux-6.12.*/.config 2>/dev/null | head -1)
-        if [ -f "$KCONFIG" ]; then
-          echo "--- Kernel .config 里的 XDP_SOCKETS ---"
-          grep -E 'XDP_SOCKETS' "$KCONFIG" || echo "⚠️ 没找到！"
+        # 1. 内核（bzImage）—— 替换路由器的 /boot/vmlinuz
+        find build_dir/target-*/linux-*/linux-6.12.*/arch/x86/boot/bzImage \
+          -exec cp {} /tmp/release/vmlinuz \; 2>/dev/null || true
+
+        # 2. 完整模块树（打成 tar.gz，便于整盘替换）
+        KDIR=$(find build_dir/target-*/linux-*/linux-6.12.* -maxdepth 0 -type d | head -1)
+        if [ -d "$KDIR/modules" ]; then
+          tar -czf /tmp/release/modules.tar.gz -C "$KDIR/modules" lib/
+        else
+          # 备用：从 staging_dir 里捞
+          tar -czf /tmp/release/modules.tar.gz \
+            -C staging_dir/target-*/root-x86/lib modules 2>/dev/null || true
         fi
 
-    - name: Package firmware artifact (full)
-      if: ${{ github.event.inputs.build_type != 'kernel' }}
-      run: |
-        cd openwrt
-        mkdir -p /tmp/release
-        cp bin/targets/x86/64/*.img.gz       /tmp/release/ 2>/dev/null || true
-        cp bin/targets/x86/64/*.iso          /tmp/release/ 2>/dev/null || true
-        cp bin/targets/x86/64/*.manifest     /tmp/release/ 2>/dev/null || true
-        # 单独也带上 xdp-nat 和 libxdp 的 apk，方便 SSH 上手动 apk add
-        find bin/packages -name 'xdp-nat*' -exec cp {} /tmp/release/ \;
-        find bin/packages -name 'libxdp*'  -exec cp {} /tmp/release/ \;
-        find bin/packages -name 'kmod-xdp*' -exec cp {} /tmp/release/ \;
-        ls -lh /tmp/release/
+        # 3. 我们的 xdp-nat 包
+        find bin/packages -name 'xdp-nat*.apk'      -exec cp {} /tmp/release/ \;
 
-    - name: Package kernel-only artifact
-      if: ${{ github.event.inputs.build_type == 'kernel' }}
-      run: |
-        cd openwrt
-        mkdir -p /tmp/release
-        cp build_dir/target-*/linux-*/linux-6.12.*/arch/x86/boot/bzImage /tmp/release/vmlinuz
-        # 模块树
-        tar -czf /tmp/release/modules.tar.gz -C build_dir/target-*/linux-*/linux-6.12.*/modules lib/
-        find bin/packages -name 'xdp-nat*' -exec cp {} /tmp/release/ \;
-        find bin/packages -name 'libxdp*'  -exec cp {} /tmp/release/ \;
-        find bin/packages -name 'kmod-xdp*' -exec cp {} /tmp/release/ \;
+        # 4. XDP 用户态工具包（如果 release 版本已经装过，其实不必替换，但带着当 backup）
+        find bin/packages -name 'libxdp*.apk'       -exec cp {} /tmp/release/ \; 2>/dev/null || true
+        find bin/packages -name 'libbpf*.apk'       -exec cp {} /tmp/release/ \; 2>/dev/null || true
+        find bin/packages -name 'xdp-loader*.apk'   -exec cp {} /tmp/release/ \; 2>/dev/null || true
+        find bin/packages -name 'xdp-filter*.apk'   -exec cp {} /tmp/release/ \; 2>/dev/null || true
+        find bin/packages -name 'bpftool*.apk'      -exec cp {} /tmp/release/ \; 2>/dev/null || true
+        find bin/packages -name 'kmod-xdp-sockets*.apk' -exec cp {} /tmp/release/ \; 2>/dev/null || true
+
+        # 5. 内核 config 快照，方便验证 XDP_SOCKETS=y
+        KCFG=$(find build_dir/target-*/linux-*/linux-6.12.*/.config | head -1)
+        cp "$KCFG" /tmp/release/kernel.config 2>/dev/null || true
+
+        echo "=== /tmp/release 内容 ==="
         ls -lh /tmp/release/
+        echo "=== 总大小 ==="
+        du -sh /tmp/release/
+        echo "=== Kernel XDP_SOCKETS 确认 ==="
+        grep XDP_SOCKETS /tmp/release/kernel.config 2>/dev/null || true
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: openwrt-${{ env.OPENWRT_VERSION }}-x86_64-xdpsockets-${{ github.run_number }}
+        name: kernel-xdpsockets-${{ github.run_number }}
         path: /tmp/release/
         retention-days: 14
         if-no-files-found: error
