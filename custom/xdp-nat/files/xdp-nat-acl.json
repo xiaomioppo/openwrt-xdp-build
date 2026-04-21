@@ -1,0 +1,36 @@
+{
+	"luci-app-xdp-nat": {
+		"description": "Grant access to xdp-nat management",
+		"read": {
+			"uci": [ "xdp-nat" ],
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/sbin/xdp-nat-ctl":  [ "exec" ],
+				"/usr/sbin/xdp-loader":   [ "exec" ],
+				"/usr/bin/pgrep":         [ "exec" ],
+				"/sbin/logread":          [ "exec" ],
+				"/etc/init.d/xdp-nat":    [ "exec" ],
+				"/run/xdp-nat.stats":     [ "read" ],
+				"/run/xdp-nat.conns":     [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec", "read" ],
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "xdp-nat", "xdp" ],
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/sbin/xdp-nat-ctl": [ "exec" ],
+				"/usr/sbin/xdp-loader":  [ "exec" ],
+				"/usr/sbin/xdp-ctl":     [ "exec" ],
+				"/etc/init.d/xdp-nat":   [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ],
+				"service": [ "event", "set", "delete" ]
+			}
+		}
+	}
+}

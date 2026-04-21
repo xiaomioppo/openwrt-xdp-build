@@ -1,0 +1,175 @@
+name: Build OpenWrt 25.12.2 x86_64 with XDP_SOCKETS + xdp-nat
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full       # 完整固件（sysupgrade img.gz）
+          - kernel     # 只打包 kernel + modules（手动替换用）
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+      - 'custom/**'
+
+env:
+  OPENWRT_VERSION: v25.12.2
+  TARGET: x86
+  SUBTARGET: 64
+
+jobs:
+  build:
+    name: Build OpenWrt
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        path: workspace
+
+    # OpenWrt build 需要 ~15GB 磁盘，GitHub runner 默认只剩 14GB
+    # 清理预装的 Android SDK / .NET / GHC / 大包，能腾出 ~40GB
+    - name: Free up disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git \
+          libncurses-dev libssl-dev python3-setuptools \
+          rsync swig unzip zlib1g-dev file wget xsltproc
+
+    - name: Clone OpenWrt ${{ env.OPENWRT_VERSION }}
+      run: |
+        git clone --depth 1 --branch ${{ env.OPENWRT_VERSION }} \
+          https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        git log -1 --oneline
+
+    - name: Enable CONFIG_XDP_SOCKETS in kernel config
+      run: |
+        cd openwrt
+        echo "--- 修改前 ---"
+        grep -n 'XDP_SOCKETS' target/linux/generic/config-6.12 || true
+        sed -i 's|^# CONFIG_XDP_SOCKETS is not set$|CONFIG_XDP_SOCKETS=y\nCONFIG_XDP_SOCKETS_DIAG=y|' \
+          target/linux/generic/config-6.12
+        echo "--- 修改后 ---"
+        grep -n 'XDP_SOCKETS' target/linux/generic/config-6.12
+
+    - name: Inject xdp-nat custom package
+      run: |
+        mkdir -p openwrt/package/custom
+        cp -r workspace/custom/xdp-nat openwrt/package/custom/xdp-nat
+        echo "--- xdp-nat 包已就位 ---"
+        ls -la openwrt/package/custom/xdp-nat/
+
+    - name: Update & install feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Configure build
+      run: |
+        cd openwrt
+        wget -q https://downloads.openwrt.org/releases/25.12.2/targets/x86/64/config.buildinfo -O .config
+        cat >> .config <<EOF
+
+        # === 我们的附加配置 ===
+        CONFIG_KERNEL_XDP_SOCKETS=y
+        CONFIG_KERNEL_XDP_SOCKETS_DIAG=y
+        CONFIG_PACKAGE_libxdp=y
+        CONFIG_PACKAGE_libbpf=y
+        CONFIG_PACKAGE_xdp-loader=y
+        CONFIG_PACKAGE_xdp-filter=y
+        CONFIG_PACKAGE_xdpdump=y
+        CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
+        CONFIG_PACKAGE_xdp-nat=y
+        CONFIG_PACKAGE_bpftool=y
+        EOF
+        make defconfig
+        echo "--- 关键项确认 ---"
+        grep -E 'XDP_SOCK|PACKAGE_libxdp|PACKAGE_xdp-|PACKAGE_kmod-xdp|PACKAGE_bpftool' .config | grep -v '^#'
+
+    - name: Download sources
+      run: |
+        cd openwrt
+        make download -j8 || make download -j1 V=s
+
+    - name: Compile (with parallel -j$(nproc))
+      run: |
+        cd openwrt
+        FORCE_UNSAFE_CONFIGURE=1 make -j$(nproc) world \
+          || (echo '--- -j$(nproc) 失败，降级到 -j1 V=s ---' && \
+              FORCE_UNSAFE_CONFIGURE=1 make -j1 V=s world)
+
+    - name: Inspect build artifacts
+      run: |
+        cd openwrt
+        echo "=== bin/targets/x86/64/ 产物 ==="
+        ls -lh bin/targets/x86/64/ 2>/dev/null || echo "(empty)"
+        echo "=== bin/packages/x86_64/ xdp-nat 包 ==="
+        find bin/packages/ -name 'xdp-nat*' -o -name 'libxdp*' -o -name 'kmod-xdp*' 2>/dev/null | xargs -I{} ls -lh {}
+        echo "=== kernel 大小 ==="
+        find build_dir/target-*/linux-*/linux-6.12.*/arch/x86/boot/bzImage 2>/dev/null | xargs -I{} ls -lh {} || true
+
+    - name: Verify XDP_SOCKETS is in built kernel
+      run: |
+        cd openwrt
+        KCONFIG=$(find build_dir/target-*/linux-*/linux-6.12.*/.config 2>/dev/null | head -1)
+        if [ -f "$KCONFIG" ]; then
+          echo "--- Kernel .config 里的 XDP_SOCKETS ---"
+          grep -E 'XDP_SOCKETS' "$KCONFIG" || echo "⚠️ 没找到！"
+        fi
+
+    - name: Package firmware artifact (full)
+      if: ${{ github.event.inputs.build_type != 'kernel' }}
+      run: |
+        cd openwrt
+        mkdir -p /tmp/release
+        cp bin/targets/x86/64/*.img.gz       /tmp/release/ 2>/dev/null || true
+        cp bin/targets/x86/64/*.iso          /tmp/release/ 2>/dev/null || true
+        cp bin/targets/x86/64/*.manifest     /tmp/release/ 2>/dev/null || true
+        # 单独也带上 xdp-nat 和 libxdp 的 apk，方便 SSH 上手动 apk add
+        find bin/packages -name 'xdp-nat*' -exec cp {} /tmp/release/ \;
+        find bin/packages -name 'libxdp*'  -exec cp {} /tmp/release/ \;
+        find bin/packages -name 'kmod-xdp*' -exec cp {} /tmp/release/ \;
+        ls -lh /tmp/release/
+
+    - name: Package kernel-only artifact
+      if: ${{ github.event.inputs.build_type == 'kernel' }}
+      run: |
+        cd openwrt
+        mkdir -p /tmp/release
+        cp build_dir/target-*/linux-*/linux-6.12.*/arch/x86/boot/bzImage /tmp/release/vmlinuz
+        # 模块树
+        tar -czf /tmp/release/modules.tar.gz -C build_dir/target-*/linux-*/linux-6.12.*/modules lib/
+        find bin/packages -name 'xdp-nat*' -exec cp {} /tmp/release/ \;
+        find bin/packages -name 'libxdp*'  -exec cp {} /tmp/release/ \;
+        find bin/packages -name 'kmod-xdp*' -exec cp {} /tmp/release/ \;
+        ls -lh /tmp/release/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-${{ env.OPENWRT_VERSION }}-x86_64-xdpsockets-${{ github.run_number }}
+        path: /tmp/release/
+        retention-days: 14
+        if-no-files-found: error

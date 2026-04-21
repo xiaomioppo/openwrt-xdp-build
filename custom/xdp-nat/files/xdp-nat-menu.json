@@ -1,0 +1,13 @@
+{
+	"admin/network/xdp/nat": {
+		"title": "XDP NAT",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "xdp-nat/manage"
+		},
+		"depends": {
+			"acl": [ "luci-app-xdp-nat" ]
+		}
+	}
+}

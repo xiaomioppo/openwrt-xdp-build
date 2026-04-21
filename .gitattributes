@@ -1,0 +1,28 @@
+# 所有文本文件在 git 里统一用 LF（Unix 行结尾）
+# 避免 Windows 本地 checkout 时被转成 CRLF，导致 OpenWrt build 上 shell 脚本和 Makefile 解析失败
+* text=auto eol=lf
+
+# 显式标记已知的文本类型
+*.c         text eol=lf
+*.h         text eol=lf
+*.js        text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.sh        text eol=lf
+*.init      text eol=lf
+*.config    text eol=lf
+Makefile    text eol=lf
+
+# 二进制不要碰
+*.bin       binary
+*.o         binary
+*.apk       binary
+*.ipk       binary
+*.img       binary
+*.img.gz    binary
+*.iso       binary
+*.tar       binary
+*.tar.gz    binary
+*.tgz       binary

@@ -1,0 +1,29 @@
+# OpenWrt build 产物（不提交，GitHub Actions 产生）
+bin/
+build_dir/
+staging_dir/
+dl/
+tmp/
+feeds/
+key-build*
+.config*
+!/.config.base
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local artifacts
+*.img
+*.img.gz
+*.iso
+*.apk
+*.ipk
+xdp_nat.new
+xdp_nat_redirect.new.o
+
+# OS
+.DS_Store
+Thumbs.db
